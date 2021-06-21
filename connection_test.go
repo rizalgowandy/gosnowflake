@@ -11,6 +11,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -316,4 +317,21 @@ func fetchResultByQueryID(t *testing.T, customget FuncGetType, expectedFetchErr 
 		t.Fatalf("rowcount is not expected 10: %v", cnt)
 	}
 	return nil
+}
+
+func TestPrivateLink(t *testing.T) {
+	_, err := buildSnowflakeConn(context.Background(), Config{
+		Account:  "testaccount",
+		User:     "testuser",
+		Password: "testpassword",
+		Host:     "testaccount.us-east-1.privatelink.snowflakecomputing.com",
+	})
+	if err != nil {
+		t.Error(err)
+	}
+	ocspURL := os.Getenv(cacheServerURLEnv)
+	expectedURL := "http://ocsp.testaccount.us-east-1.privatelink.snowflakecomputing.com/ocsp_response_cache.json"
+	if ocspURL != expectedURL {
+		t.Errorf("expected: %v, got: %v", expectedURL, ocspURL)
+	}
 }
