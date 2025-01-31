@@ -1,4 +1,4 @@
-// Copyright (c) 2021 Snowflake Computing Inc. All right reserved.
+// Copyright (c) 2021-2022 Snowflake Computing Inc. All rights reserved.
 
 package gosnowflake
 
@@ -23,13 +23,13 @@ func (t *DummyTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 		}
 		return &http.Response{StatusCode: 200}, nil
 	}
-	return snowflakeInsecureTransport.RoundTrip(r)
+	return snowflakeNoOcspTransport.RoundTrip(r)
 }
 
 func TestInternalClient(t *testing.T) {
 	config, err := ParseDSN(dsn)
 	if err != nil {
-		t.Fatalf("failed to parse dsn. dsn: %v, err: %v", dsn, err)
+		t.Fatalf("failed to parse dsn. err: %v", err)
 	}
 	transport := DummyTransport{}
 	config.Transporter = &transport
@@ -48,7 +48,7 @@ func TestInternalClient(t *testing.T) {
 		t.Fatalf("Expected exactly one GET request, got %v", transport.getRequests)
 	}
 
-	resp, err = internalClient.Post(context.Background(), &url.URL{}, make(map[string]string), make([]byte, 0), 0, false)
+	resp, err = internalClient.Post(context.Background(), &url.URL{}, make(map[string]string), make([]byte, 0), 0, defaultTimeProvider)
 	if err != nil || resp.StatusCode != 200 {
 		t.Fail()
 	}
