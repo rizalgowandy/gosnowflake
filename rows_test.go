@@ -1,9 +1,10 @@
-// Copyright (c) 2017-2021 Snowflake Computing Inc. All right reserved.
+// Copyright (c) 2017-2022 Snowflake Computing Inc. All rights reserved.
 
 package gosnowflake
 
 import (
 	"context"
+	"database/sql"
 	"database/sql/driver"
 	"fmt"
 	"io"
@@ -13,10 +14,81 @@ import (
 	"time"
 )
 
+type RowsExtended struct {
+	rows      *sql.Rows
+	closeChan *chan bool
+}
+
+func (rs *RowsExtended) Close() error {
+	*rs.closeChan <- true
+	close(*rs.closeChan)
+	return rs.rows.Close()
+}
+
+func (rs *RowsExtended) ColumnTypes() ([]*sql.ColumnType, error) {
+	return rs.rows.ColumnTypes()
+}
+
+func (rs *RowsExtended) Columns() ([]string, error) {
+	return rs.rows.Columns()
+}
+
+func (rs *RowsExtended) Err() error {
+	return rs.rows.Err()
+}
+
+func (rs *RowsExtended) Next() bool {
+	return rs.rows.Next()
+}
+
+func (rs *RowsExtended) NextResultSet() bool {
+	return rs.rows.NextResultSet()
+}
+
+func (rs *RowsExtended) Scan(dest ...interface{}) error {
+	return rs.rows.Scan(dest...)
+}
+
 // test variables
 var (
 	rowsInChunk = 123
 )
+
+// Special cases where rows are already closed
+func TestRowsClose(t *testing.T) {
+	runDBTest(t, func(dbt *DBTest) {
+		rows, err := dbt.query("SELECT 1")
+		if err != nil {
+			dbt.Fatal(err)
+		}
+		if err = rows.Close(); err != nil {
+			dbt.Fatal(err)
+		}
+
+		if rows.Next() {
+			dbt.Fatal("unexpected row after rows.Close()")
+		}
+		if err = rows.Err(); err != nil {
+			dbt.Fatal(err)
+		}
+	})
+}
+
+func TestResultNoRows(t *testing.T) {
+	// DDL
+	runDBTest(t, func(dbt *DBTest) {
+		row, err := dbt.exec("CREATE OR REPLACE TABLE test(c1 int)")
+		if err != nil {
+			t.Fatalf("failed to execute DDL. err: %v", err)
+		}
+		if _, err = row.RowsAffected(); err == nil {
+			t.Fatal("should have failed to get RowsAffected")
+		}
+		if _, err = row.LastInsertId(); err == nil {
+			t.Fatal("should have failed to get LastInsertID")
+		}
+	})
+}
 
 func TestRowsWithoutChunkDownloader(t *testing.T) {
 	sts1 := "1"
@@ -32,9 +104,15 @@ func TestRowsWithoutChunkDownloader(t *testing.T) {
 	}
 	cm := []execResponseChunk{}
 	rows := new(snowflakeRows)
-	rows.sc = nil
+	sc := &snowflakeConn{
+		cfg: &Config{
+			Params: make(map[string]*string),
+		},
+	}
+	rows.sc = sc
+	rows.ctx = context.Background()
 	rows.ChunkDownloader = &snowflakeChunkDownloader{
-		sc:                 nil,
+		sc:                 sc,
 		ctx:                context.Background(),
 		Total:              int64(len(cc)),
 		ChunkMetas:         cm,
@@ -45,7 +123,8 @@ func TestRowsWithoutChunkDownloader(t *testing.T) {
 		RowSet:             rowSetType{RowType: rt, JSON: cc},
 		QueryResultFormat:  "json",
 	}
-	rows.ChunkDownloader.start()
+	err := rows.ChunkDownloader.start()
+	assertNilF(t, err)
 	dest := make([]driver.Value, 2)
 	for i = 0; i < len(cc); i++ {
 		if err := rows.Next(dest); err != nil {
@@ -101,9 +180,15 @@ func TestRowsWithChunkDownloader(t *testing.T) {
 		cm = append(cm, execResponseChunk{URL: fmt.Sprintf("dummyURL%v", i+1), RowCount: rowsInChunk})
 	}
 	rows := new(snowflakeRows)
-	rows.sc = nil
+	sc := &snowflakeConn{
+		cfg: &Config{
+			Params: make(map[string]*string),
+		},
+	}
+	rows.sc = sc
+	rows.ctx = context.Background()
 	rows.ChunkDownloader = &snowflakeChunkDownloader{
-		sc:            nil,
+		sc:            sc,
 		ctx:           context.Background(),
 		Total:         int64(len(cc) + numChunks*rowsInChunk),
 		ChunkMetas:    cm,
@@ -112,7 +197,7 @@ func TestRowsWithChunkDownloader(t *testing.T) {
 		FuncDownload:  downloadChunkTest,
 		RowSet:        rowSetType{RowType: rt, JSON: cc},
 	}
-	rows.ChunkDownloader.start()
+	assertNilF(t, rows.ChunkDownloader.start())
 	cnt := 0
 	dest := make([]driver.Value, 2)
 	var err error
@@ -180,9 +265,15 @@ func TestRowsWithChunkDownloaderError(t *testing.T) {
 		cm = append(cm, execResponseChunk{URL: fmt.Sprintf("dummyURL%v", i+1), RowCount: rowsInChunk})
 	}
 	rows := new(snowflakeRows)
-	rows.sc = nil
+	sc := &snowflakeConn{
+		cfg: &Config{
+			Params: make(map[string]*string),
+		},
+	}
+	rows.sc = sc
+	rows.ctx = context.Background()
 	rows.ChunkDownloader = &snowflakeChunkDownloader{
-		sc:            nil,
+		sc:            sc,
 		ctx:           context.Background(),
 		Total:         int64(len(cc) + numChunks*rowsInChunk),
 		ChunkMetas:    cm,
@@ -191,7 +282,7 @@ func TestRowsWithChunkDownloaderError(t *testing.T) {
 		FuncDownload:  downloadChunkTestError,
 		RowSet:        rowSetType{RowType: rt, JSON: cc},
 	}
-	rows.ChunkDownloader.start()
+	assertNilF(t, rows.ChunkDownloader.start())
 	cnt := 0
 	dest := make([]driver.Value, 2)
 	var err error
@@ -258,9 +349,15 @@ func TestRowsWithChunkDownloaderErrorFail(t *testing.T) {
 		cm = append(cm, execResponseChunk{URL: fmt.Sprintf("dummyURL%v", i+1), RowCount: rowsInChunk})
 	}
 	rows := new(snowflakeRows)
-	rows.sc = nil
+	sc := &snowflakeConn{
+		cfg: &Config{
+			Params: make(map[string]*string),
+		},
+	}
+	rows.sc = sc
+	rows.ctx = context.Background()
 	rows.ChunkDownloader = &snowflakeChunkDownloader{
-		sc:            nil,
+		sc:            sc,
 		ctx:           context.Background(),
 		Total:         int64(len(cc) + numChunks*rowsInChunk),
 		ChunkMetas:    cm,
@@ -269,7 +366,7 @@ func TestRowsWithChunkDownloaderErrorFail(t *testing.T) {
 		FuncDownload:  downloadChunkTestErrorFail,
 		RowSet:        rowSetType{RowType: rt, JSON: cc},
 	}
-	rows.ChunkDownloader.start()
+	assertNilF(t, rows.ChunkDownloader.start())
 	cnt := 0
 	dest := make([]driver.Value, 2)
 	var err error
@@ -287,7 +384,7 @@ func TestRowsWithChunkDownloaderErrorFail(t *testing.T) {
 	}
 }
 
-func getChunkTestInvalidResponseBody(_ context.Context, _ *snowflakeChunkDownloader, _ string, _ map[string]string, _ time.Duration) (
+func getChunkTestInvalidResponseBody(_ context.Context, _ *snowflakeConn, _ string, _ map[string]string, _ time.Duration) (
 	*http.Response, error) {
 	return &http.Response{
 		StatusCode: http.StatusOK,
@@ -329,7 +426,7 @@ func TestDownloadChunkInvalidResponseBody(t *testing.T) {
 	}
 }
 
-func getChunkTestErrorStatus(_ context.Context, _ *snowflakeChunkDownloader, _ string, _ map[string]string, _ time.Duration) (
+func getChunkTestErrorStatus(_ context.Context, _ *snowflakeConn, _ string, _ map[string]string, _ time.Duration) (
 	*http.Response, error) {
 	return &http.Response{
 		StatusCode: http.StatusBadGateway,
@@ -376,4 +473,61 @@ func TestDownloadChunkErrorStatus(t *testing.T) {
 	default:
 		t.Fatal("should have caused an error and queued in scd.ChunksError")
 	}
+}
+
+func TestWithArrowBatchesNotImplementedForResult(t *testing.T) {
+	ctx := WithArrowBatches(context.Background())
+	runSnowflakeConnTest(t, func(sct *SCTest) {
+
+		sct.mustExec("create or replace table testArrowBatches (a int, b int)", nil)
+		defer sct.mustExec("drop table if exists testArrowBatches", nil)
+
+		result := sct.mustExecContext(ctx, "insert into testArrowBatches values (1, 2), (3, 4), (5, 6)", []driver.NamedValue{})
+
+		_, err := result.(*snowflakeResult).GetArrowBatches()
+		if err == nil {
+			t.Fatal("should have raised an error")
+		}
+		driverErr, ok := err.(*SnowflakeError)
+		if !ok {
+			t.Fatalf("should be snowflake error. err: %v", err)
+		}
+		if driverErr.Number != ErrNotImplemented {
+			t.Fatalf("unexpected error code. expected: %v, got: %v", ErrNotImplemented, driverErr.Number)
+		}
+	})
+}
+
+func TestLocationChangesAfterAlterSession(t *testing.T) {
+	runDBTest(t, func(dbt *DBTest) {
+		dbt.mustExec("CREATE OR REPLACE TABLE location_timestamp_ltz (val timestamp_ltz)")
+		defer dbt.mustExec("DROP TABLE location_timestamp_ltz")
+		dbt.mustExec("ALTER SESSION SET TIMEZONE = 'Europe/Warsaw'")
+		dbt.mustExec("INSERT INTO location_timestamp_ltz VALUES('2023-08-09 10:00:00')")
+		rows1 := dbt.mustQuery("SELECT * FROM location_timestamp_ltz")
+		defer func() {
+			assertNilF(t, rows1.Close())
+		}()
+		if !rows1.Next() {
+			t.Fatalf("cannot read a record")
+		}
+		var t1 time.Time
+		assertNilF(t, rows1.Scan(&t1))
+		if t1.Location().String() != "Europe/Warsaw" {
+			t.Fatalf("should return time in Warsaw timezone")
+		}
+		dbt.mustExec("ALTER SESSION SET TIMEZONE = 'Pacific/Honolulu'")
+		rows2 := dbt.mustQuery("SELECT * FROM location_timestamp_ltz")
+		defer func() {
+			assertNilF(t, rows2.Close())
+		}()
+		if !rows2.Next() {
+			t.Fatalf("cannot read a record")
+		}
+		var t2 time.Time
+		assertNilF(t, rows2.Scan(&t2))
+		if t2.Location().String() != "Pacific/Honolulu" {
+			t.Fatalf("should return time in Honolulu timezone")
+		}
+	})
 }

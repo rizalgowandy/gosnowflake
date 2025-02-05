@@ -1,4 +1,4 @@
-// Copyright (c) 2020 Snowflake Computing Inc. All right reserved.
+// Copyright (c) 2020-2022 Snowflake Computing Inc. All rights reserved.
 
 package gosnowflake
 
@@ -20,7 +20,7 @@ type Connector struct {
 }
 
 // NewConnector creates a new connector with the given SnowflakeDriver and Config.
-func NewConnector(driver InternalSnowflakeDriver, config Config) Connector {
+func NewConnector(driver InternalSnowflakeDriver, config Config) driver.Connector {
 	return Connector{driver, config}
 }
 
