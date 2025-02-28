@@ -1,93 +1,125 @@
 name: Build and Test
 
 on:
-    push:
-        braches:
-            - master
-        tags:
-            - v*
-    pull_request:
-        branches:
-            - master
-    schedule:
-      - cron:  '7 3 * * *'
-    workflow_dispatch:
-        inputs:
-          logLevel:
-            default: warning
-            description: "Log level"
-            required: true
-          tags:
-            description: "Test scenario tags"
+  push:
+    branches:
+      - master
+    tags:
+      - v*
+  pull_request:
+    branches:
+      - master
+      - SNOW-*
+  schedule:
+    - cron: '7 3 * * *'
+  workflow_dispatch:
+    inputs:
+      goTestParams:
+        default:
+        description: 'Parameters passed to go test'
+
+concurrency:
+  # older builds for the same pull request numer or branch should be cancelled
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
+    lint:
+        runs-on: ubuntu-latest
+        name: Check linter
+        steps:
+          - uses: actions/checkout@v4
+          - name: Setup go
+            uses: actions/setup-go@v5
+            with:
+              go-version-file: './go.mod'
+          - name: golangci-lint
+            uses: golangci/golangci-lint-action@v6
+            with:
+              version: v1.60
+          - name: Format, Lint
+            shell: bash
+            run: ./ci/build.sh
     build-test-linux:
         runs-on: ubuntu-latest
         strategy:
+            fail-fast: false
             matrix:
                 cloud: [ 'AWS', 'AZURE', 'GCP' ]
-                go: [ '1.17', '1.16' ]
+                go: [ '1.22', '1.23', '1.24' ]
         name: ${{ matrix.cloud }} Go ${{ matrix.go }} on Ubuntu
         steps:
-            - uses: actions/checkout@v1
+            - uses: actions/checkout@v4
+            - uses: actions/setup-java@v4 # for wiremock
+              with:
+                java-version: 17
+                distribution: 'temurin'
             - name: Setup go
-              uses: actions/setup-go@v2
+              uses: actions/setup-go@v5
               with:
                   go-version: ${{ matrix.go }}
-            - name: Format, Lint and WSS
-              shell: bash
-              env:
-                WHITESOURCE_API_KEY: ${{ secrets.WHITESOURCE_API_KEY }}
-              run: ./ci/build.sh
             - name: Test
               shell: bash
               env:
                 PARAMETERS_SECRET: ${{ secrets.PARAMETERS_SECRET }}
                 CLOUD_PROVIDER: ${{ matrix.cloud }}
+                GORACE: history_size=7
+                GO_TEST_PARAMS: ${{ inputs.goTestParams }}
+                WIREMOCK_PORT: 14335
               run: ./ci/test.sh
+            - name: Upload coverage to Codecov
+              uses: codecov/codecov-action@v5
+              with:
+                token: ${{ secrets.CODE_COV_UPLOAD_TOKEN }}
     build-test-mac:
         runs-on: macos-latest
         strategy:
+            fail-fast: false
             matrix:
                 cloud: [ 'AWS', 'AZURE', 'GCP' ]
-                go: [ '1.17', '1.16' ]
+                go: [ '1.22', '1.23', '1.24' ]
         name: ${{ matrix.cloud }} Go ${{ matrix.go }} on Mac
         steps:
-            - uses: actions/checkout@v1
+            - uses: actions/checkout@v4
+            - uses: actions/setup-java@v4 # for wiremock
+              with:
+                java-version: 17
+                distribution: 'temurin'
             - name: Setup go
-              uses: actions/setup-go@v2
+              uses: actions/setup-go@v5
               with:
                   go-version: ${{ matrix.go }}
-            - name: Format, Lint and WSS
-              shell: bash
-              env:
-                WHITESOURCE_API_KEY: ${{ secrets.WHITESOURCE_API_KEY }}
-              run: ./ci/build.sh
             - name: Test
               shell: bash
               env:
                 PARAMETERS_SECRET: ${{ secrets.PARAMETERS_SECRET }}
                 CLOUD_PROVIDER: ${{ matrix.cloud }}
+                GO_TEST_PARAMS: ${{ inputs.goTestParams }}
+                WIREMOCK_PORT: 14335
               run: ./ci/test.sh
+            - name: Upload coverage to Codecov
+              uses: codecov/codecov-action@v5
+              with:
+                token: ${{ secrets.CODE_COV_UPLOAD_TOKEN }}
     build-test-windows:
         runs-on: windows-latest
         strategy:
+            fail-fast: false
             matrix:
                 cloud: [ 'AWS', 'AZURE', 'GCP' ]
-                go: [ '1.17', '1.16' ]
+                go: [ '1.22', '1.23', '1.24' ]
         name: ${{ matrix.cloud }} Go ${{ matrix.go }} on Windows
         steps:
-            - uses: actions/checkout@v1
+            - uses: actions/checkout@v4
+            - uses: actions/setup-java@v4 # for wiremock
+              with:
+                java-version: 17
+                distribution: 'temurin'
             - name: Setup go
-              uses: actions/setup-go@v2
+              uses: actions/setup-go@v5
               with:
                   go-version: ${{ matrix.go }}
-            - name: Format, Lint and WSS
-              shell: cmd
-              env:
-                WHITESOURCE_API_KEY: ${{ secrets.WHITESOURCE_API_KEY }}
-              run: ci\\build.bat
-            - uses: actions/setup-python@v1
+            - uses: actions/setup-python@v5
               with:
                 python-version: '3.x'
                 architecture: 'x64'
@@ -96,4 +128,10 @@ jobs:
               env:
                 PARAMETERS_SECRET: ${{ secrets.PARAMETERS_SECRET }}
                 CLOUD_PROVIDER: ${{ matrix.cloud }}
+                GO_TEST_PARAMS: ${{ inputs.goTestParams }}
+                WIREMOCK_PORT: 14335
               run: ci\\test.bat
+            - name: Upload coverage to Codecov
+              uses: codecov/codecov-action@v5
+              with:
+                token: ${{ secrets.CODE_COV_UPLOAD_TOKEN }}
