@@ -1,16 +1,24 @@
-// Copyright (c) 2021 Snowflake Computing Inc. All right reserved.
+// Copyright (c) 2021-2022 Snowflake Computing Inc. All rights reserved.
 
 package gosnowflake
 
 import (
 	"bytes"
 	"context"
+	"database/sql/driver"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/ipc"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 )
 
 func TestBadChunkData(t *testing.T) {
@@ -325,9 +333,9 @@ func generateStreamChunkDownloaderChunks(urls []string, numRows, numCols int) (m
 }
 
 func generateStreamChunkRows(numRows, numCols int) [][]*string {
-	rows := [][]*string{}
+	var rows [][]*string
 	for i := 0; i < numRows; i++ {
-		cols := []*string{}
+		var cols []*string
 		for j := 0; j < numCols; j++ {
 			col := fmt.Sprintf("%d", rand.Intn(1000))
 			cols = append(cols, &col)
@@ -368,7 +376,7 @@ func TestWithStreamDownloader(t *testing.T) {
 	var idx int
 	var v string
 
-	runTests(t, dsn, func(dbt *DBTest) {
+	runDBTest(t, func(dbt *DBTest) {
 		dbt.mustExec(forceJSON)
 		rows := dbt.mustQueryContext(ctx, fmt.Sprintf(selectRandomGenerator, numrows))
 		defer rows.Close()
@@ -385,5 +393,318 @@ func TestWithStreamDownloader(t *testing.T) {
 		if cnt != numrows {
 			t.Errorf("number of rows didn't match. expected: %v, got: %v", numrows, cnt)
 		}
+	})
+}
+
+func TestWithArrowBatches(t *testing.T) {
+	runSnowflakeConnTest(t, func(sct *SCTest) {
+		ctx := WithArrowBatches(sct.sc.ctx)
+		numrows := 3000 // approximately 6 ArrowBatch objects
+
+		pool := memory.NewCheckedAllocator(memory.DefaultAllocator)
+		defer pool.AssertSize(t, 0)
+		ctx = WithArrowAllocator(ctx, pool)
+
+		query := fmt.Sprintf(selectRandomGenerator, numrows)
+		rows := sct.mustQueryContext(ctx, query, []driver.NamedValue{})
+		defer rows.Close()
+
+		// getting result batches
+		batches, err := rows.(*snowflakeRows).GetArrowBatches()
+		if err != nil {
+			t.Error(err)
+		}
+		numBatches := len(batches)
+		maxWorkers := 10 // enough for 3000 rows
+		type count struct {
+			m       sync.Mutex
+			recVal  int
+			metaVal int
+		}
+		cnt := count{recVal: 0}
+		var wg sync.WaitGroup
+		chunks := make(chan int, numBatches)
+
+		// kicking off download workers - each of which will call fetch on a different result batch
+		for w := 1; w <= maxWorkers; w++ {
+			wg.Add(1)
+			go func(wg *sync.WaitGroup, chunks <-chan int) {
+				defer wg.Done()
+
+				for i := range chunks {
+					rec, err := batches[i].Fetch()
+					if err != nil {
+						t.Error(err)
+					}
+					for _, r := range *rec {
+						cnt.m.Lock()
+						cnt.recVal += int(r.NumRows())
+						cnt.m.Unlock()
+						r.Release()
+					}
+					cnt.m.Lock()
+					cnt.metaVal += batches[i].rowCount
+					cnt.m.Unlock()
+				}
+			}(&wg, chunks)
+		}
+		for j := 0; j < numBatches; j++ {
+			chunks <- j
+		}
+		close(chunks)
+
+		// wait for workers to finish fetching and check row counts
+		wg.Wait()
+		if cnt.recVal != numrows {
+			t.Errorf("number of rows from records didn't match. expected: %v, got: %v", numrows, cnt.recVal)
+		}
+		if cnt.metaVal != numrows {
+			t.Errorf("number of rows from arrow batch metadata didn't match. expected: %v, got: %v", numrows, cnt.metaVal)
+		}
+	})
+}
+
+func TestWithArrowBatchesAsync(t *testing.T) {
+	runSnowflakeConnTest(t, func(sct *SCTest) {
+		ctx := WithAsyncMode(sct.sc.ctx)
+		ctx = WithArrowBatches(ctx)
+		numrows := 50000 // approximately 10 ArrowBatch objects
+
+		pool := memory.NewCheckedAllocator(memory.DefaultAllocator)
+		defer pool.AssertSize(t, 0)
+		ctx = WithArrowAllocator(ctx, pool)
+
+		query := fmt.Sprintf(selectRandomGenerator, numrows)
+		rows := sct.mustQueryContext(ctx, query, []driver.NamedValue{})
+		defer rows.Close()
+
+		// getting result batches
+		// this will fail if GetArrowBatches() is not a blocking call
+		batches, err := rows.(*snowflakeRows).GetArrowBatches()
+		if err != nil {
+			t.Error(err)
+		}
+		numBatches := len(batches)
+		maxWorkers := 10
+		type count struct {
+			m       sync.Mutex
+			recVal  int
+			metaVal int
+		}
+		cnt := count{recVal: 0}
+		var wg sync.WaitGroup
+		chunks := make(chan int, numBatches)
+
+		// kicking off download workers - each of which will call fetch on a different result batch
+		for w := 1; w <= maxWorkers; w++ {
+			wg.Add(1)
+			go func(wg *sync.WaitGroup, chunks <-chan int) {
+				defer wg.Done()
+
+				for i := range chunks {
+					rec, err := batches[i].Fetch()
+					if err != nil {
+						t.Error(err)
+					}
+					for _, r := range *rec {
+						cnt.m.Lock()
+						cnt.recVal += int(r.NumRows())
+						cnt.m.Unlock()
+						r.Release()
+					}
+					cnt.m.Lock()
+					cnt.metaVal += batches[i].rowCount
+					cnt.m.Unlock()
+				}
+			}(&wg, chunks)
+		}
+		for j := 0; j < numBatches; j++ {
+			chunks <- j
+		}
+		close(chunks)
+
+		// wait for workers to finish fetching and check row counts
+		wg.Wait()
+		if cnt.recVal != numrows {
+			t.Errorf("number of rows from records didn't match. expected: %v, got: %v", numrows, cnt.recVal)
+		}
+		if cnt.metaVal != numrows {
+			t.Errorf("number of rows from arrow batch metadata didn't match. expected: %v, got: %v", numrows, cnt.metaVal)
+		}
+	})
+}
+
+func TestWithArrowBatchesButReturningJSON(t *testing.T) {
+	testWithArrowBatchesButReturningJSON(t, false)
+}
+
+func TestWithArrowBatchesButReturningJSONAsync(t *testing.T) {
+	testWithArrowBatchesButReturningJSON(t, true)
+}
+
+func testWithArrowBatchesButReturningJSON(t *testing.T, async bool) {
+	runSnowflakeConnTest(t, func(sct *SCTest) {
+		requestID := NewUUID()
+		pool := memory.NewCheckedAllocator(memory.DefaultAllocator)
+		defer pool.AssertSize(t, 0)
+		ctx := WithArrowAllocator(context.Background(), pool)
+		ctx = WithArrowBatches(ctx)
+		ctx = WithRequestID(ctx, requestID)
+		if async {
+			ctx = WithAsyncMode(ctx)
+		}
+
+		sct.mustExec(forceJSON, nil)
+		rows := sct.mustQueryContext(ctx, "SELECT 'hello'", nil)
+		defer rows.Close()
+		_, err := rows.(SnowflakeRows).GetArrowBatches()
+		assertNotNilF(t, err)
+		var se *SnowflakeError
+		assertTrueE(t, errors.As(err, &se))
+		assertEqualE(t, se.Message, errMsgNonArrowResponseInArrowBatches)
+		assertEqualE(t, se.Number, ErrNonArrowResponseInArrowBatches)
+
+		v := make([]driver.Value, 1)
+		assertNilE(t, rows.Next(v))
+		assertEqualE(t, v[0], "hello")
+	})
+}
+
+func TestQueryArrowStream(t *testing.T) {
+	runSnowflakeConnTest(t, func(sct *SCTest) {
+		numrows := 50000 // approximately 10 ArrowBatch objects
+
+		query := fmt.Sprintf(selectRandomGenerator, numrows)
+		loader, err := sct.sc.QueryArrowStream(sct.sc.ctx, query)
+		if err != nil {
+			t.Error(err)
+		}
+
+		if loader.TotalRows() != int64(numrows) {
+			t.Errorf("total numrows did not match expected, wanted %v, got %v", numrows, loader.TotalRows())
+		}
+
+		batches, err := loader.GetBatches()
+		if err != nil {
+			t.Error(err)
+		}
+
+		numBatches := len(batches)
+		maxWorkers := 8
+		chunks := make(chan int, numBatches)
+		total := int64(0)
+		meta := int64(0)
+
+		var wg sync.WaitGroup
+		wg.Add(maxWorkers)
+
+		mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
+		defer mem.AssertSize(t, 0)
+
+		for w := 0; w < maxWorkers; w++ {
+			go func() {
+				defer wg.Done()
+
+				for i := range chunks {
+					r, err := batches[i].GetStream(sct.sc.ctx)
+					if err != nil {
+						t.Error(err)
+						continue
+					}
+					rdr, err := ipc.NewReader(r, ipc.WithAllocator(mem))
+					if err != nil {
+						t.Errorf("Error creating IPC reader for stream %d: %s", i, err)
+						r.Close()
+						continue
+					}
+
+					for rdr.Next() {
+						rec := rdr.Record()
+						atomic.AddInt64(&total, rec.NumRows())
+					}
+
+					if rdr.Err() != nil {
+						t.Error(rdr.Err())
+					}
+					rdr.Release()
+					if err := r.Close(); err != nil {
+						t.Error(err)
+					}
+					atomic.AddInt64(&meta, batches[i].NumRows())
+				}
+			}()
+		}
+
+		for j := 0; j < numBatches; j++ {
+			chunks <- j
+		}
+		close(chunks)
+		wg.Wait()
+
+		if total != int64(numrows) {
+			t.Errorf("number of rows from records didn't match. expected: %v, got: %v", numrows, total)
+		}
+		if meta != int64(numrows) {
+			t.Errorf("number of rows from batch metadata didn't match. expected: %v, got: %v", numrows, total)
+		}
+	})
+}
+
+func TestQueryArrowStreamDescribeOnly(t *testing.T) {
+	runSnowflakeConnTest(t, func(sct *SCTest) {
+		numrows := 50000 // approximately 10 ArrowBatch objects
+
+		query := fmt.Sprintf(selectRandomGenerator, numrows)
+		loader, err := sct.sc.QueryArrowStream(WithDescribeOnly(sct.sc.ctx), query)
+		assertNilF(t, err, "failed to run query")
+
+		if loader.TotalRows() != 0 {
+			t.Errorf("total numrows did not match expected, wanted 0, got %v", loader.TotalRows())
+		}
+
+		batches, err := loader.GetBatches()
+		assertNilF(t, err, "failed to get result")
+		if len(batches) != 0 {
+			t.Errorf("batches length did not match expected, wanted 0, got %v", len(batches))
+		}
+
+		rowtypes := loader.RowTypes()
+		if len(rowtypes) != 2 {
+			t.Errorf("rowTypes length did not match expected, wanted 2, got %v", len(rowtypes))
+		}
+	})
+}
+
+func TestRetainChunkWOHighPrecision(t *testing.T) {
+	runDBTest(t, func(dbt *DBTest) {
+		var rows driver.Rows
+		var err error
+
+		err = dbt.conn.Raw(func(connection interface{}) error {
+			rows, err = connection.(driver.QueryerContext).QueryContext(WithArrowBatches(context.Background()), "select 0", nil)
+			return err
+		})
+		assertNilF(t, err, "error running select 0 query")
+
+		arrowBatches, err := rows.(SnowflakeRows).GetArrowBatches()
+		assertNilF(t, err, "error getting arrow batches")
+		assertEqualF(t, len(arrowBatches), 1, "should have one batch")
+
+		records, err := arrowBatches[0].Fetch()
+		assertNilF(t, err, "error getting batch")
+		assertNotNilF(t, records, "records should not be nil")
+
+		numRecords := len(*records)
+		assertEqualF(t, numRecords, 1, "should have exactly one record")
+
+		record := (*records)[0]
+		assertEqualF(t, len(record.Columns()), 1, "should have exactly one column")
+
+		column := record.Column(0).(*array.Int8)
+		row := column.Len()
+		assertEqualF(t, row, 1, "should have exactly one row")
+
+		int8Val := column.Value(0)
+		assertEqualF(t, int8Val, int8(0), "value of cell should be 0")
 	})
 }

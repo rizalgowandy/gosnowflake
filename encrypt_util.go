@@ -1,4 +1,4 @@
-// Copyright (c) 2021 Snowflake Computing Inc. All right reserved.
+// Copyright (c) 2021-2022 Snowflake Computing Inc. All rights reserved.
 
 package gosnowflake
 
@@ -11,24 +11,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"strconv"
 )
 
-type snowflakeFileEncryption struct {
-	QueryStageMasterKey string `json:"queryStageMasterKey,omitempty"`
-	QueryID             string `json:"queryId,omitempty"`
-	SMKID               int64  `json:"smkId,omitempty"`
-}
+const gcmIvLengthInBytes = 12
 
-// PUT requests return a single encryptionMaterial object whereas GET requests
-// return a slice (array) of encryptionMaterial objects, both under the field
-// 'encryptionMaterial'
-type encryptionWrapper struct {
-	snowflakeFileEncryption
-	EncryptionMaterials []snowflakeFileEncryption
-}
+var (
+	defaultKeyAad  = make([]byte, 0)
+	defaultDataAad = make([]byte, 0)
+)
 
 // override default behavior for wrapper
 func (ew *encryptionWrapper) UnmarshalJSON(data []byte) error {
@@ -40,15 +32,9 @@ func (ew *encryptionWrapper) UnmarshalJSON(data []byte) error {
 	return json.Unmarshal(data, &ew.snowflakeFileEncryption)
 }
 
-type encryptMetadata struct {
-	key     string
-	iv      string
-	matdesc string
-}
-
-// encryptStream encrypts a stream buffer using AES128 block cipher in CBC mode
+// encryptStreamCBC encrypts a stream buffer using AES128 block cipher in CBC mode
 // with PKCS5 padding
-func encryptStream(
+func encryptStreamCBC(
 	sfe *snowflakeFileEncryption,
 	src io.Reader,
 	out io.Writer,
@@ -56,45 +42,57 @@ func encryptStream(
 	if chunkSize == 0 {
 		chunkSize = aes.BlockSize * 4 * 1024
 	}
-	decodedKey, _ := base64.StdEncoding.DecodeString(sfe.QueryStageMasterKey)
-	keySize := len(decodedKey)
+	kek, err := base64.StdEncoding.DecodeString(sfe.QueryStageMasterKey)
+	if err != nil {
+		return nil, err
+	}
+	keySize := len(kek)
 
 	fileKey := getSecureRandom(keySize)
-	block, _ := aes.NewCipher(fileKey)
-	ivData := getSecureRandom(block.BlockSize())
+	block, err := aes.NewCipher(fileKey)
+	if err != nil {
+		return nil, err
+	}
+	dataIv := getSecureRandom(block.BlockSize())
 
-	mode := cipher.NewCBCEncrypter(block, ivData)
+	mode := cipher.NewCBCEncrypter(block, dataIv)
 	cipherText := make([]byte, chunkSize)
+	chunk := make([]byte, chunkSize)
 
 	// encrypt file with CBC
-	var err error
 	padded := false
 	for {
-		chunk := make([]byte, chunkSize)
+		// read the stream buffer up to len(chunk) bytes into chunk
+		// note that all spaces in chunk may be used even if Read() returns n < len(chunk)
 		n, err := src.Read(chunk)
 		if n == 0 || err != nil {
 			break
 		} else if n%aes.BlockSize != 0 {
+			// add padding to the end of the chunk and update the length n
 			chunk = padBytesLength(chunk[:n], aes.BlockSize)
+			n = len(chunk)
 			padded = true
 		}
-		mode.CryptBlocks(cipherText, chunk)
-		out.Write(cipherText[:len(chunk)])
+		// make sure only n bytes of chunk is used
+		mode.CryptBlocks(cipherText, chunk[:n])
+		if _, err := out.Write(cipherText[:n]); err != nil {
+			return nil, err
+		}
 	}
-	if err != nil {
-		return nil, err
-	}
+
+	// add padding if not yet added
 	if !padded {
-		blockSizeCipher := bytes.Repeat([]byte{byte(aes.BlockSize)}, aes.BlockSize)
-		chunk := make([]byte, aes.BlockSize)
-		mode.CryptBlocks(chunk, blockSizeCipher)
-		out.Write(chunk)
+		padding := bytes.Repeat([]byte(string(rune(aes.BlockSize))), aes.BlockSize)
+		mode.CryptBlocks(cipherText, padding)
+		if _, err := out.Write(cipherText[:len(padding)]); err != nil {
+			return nil, err
+		}
 	}
 
 	// encrypt key with ECB
 	fileKey = padBytesLength(fileKey, block.BlockSize())
 	encryptedFileKey := make([]byte, len(fileKey))
-	if err = encryptECB(encryptedFileKey, fileKey, decodedKey); err != nil {
+	if err = encryptECB(encryptedFileKey, fileKey, kek); err != nil {
 		return nil, err
 	}
 
@@ -104,15 +102,22 @@ func encryptStream(
 		strconv.Itoa(keySize * 8),
 	}
 
+	matDescUnicode, err := matdescToUnicode(matDesc)
+	if err != nil {
+		return nil, err
+	}
 	return &encryptMetadata{
 		base64.StdEncoding.EncodeToString(encryptedFileKey),
-		base64.StdEncoding.EncodeToString(ivData),
-		matdescToUnicode(matDesc),
+		base64.StdEncoding.EncodeToString(dataIv),
+		matDescUnicode,
 	}, nil
 }
 
 func encryptECB(encrypted []byte, fileKey []byte, decodedKey []byte) error {
-	block, _ := aes.NewCipher(decodedKey)
+	block, err := aes.NewCipher(decodedKey)
+	if err != nil {
+		return err
+	}
 	if len(fileKey)%block.BlockSize() != 0 {
 		return fmt.Errorf("input not full of blocks")
 	}
@@ -128,7 +133,10 @@ func encryptECB(encrypted []byte, fileKey []byte, decodedKey []byte) error {
 }
 
 func decryptECB(decrypted []byte, keyBytes []byte, decodedKey []byte) error {
-	block, _ := aes.NewCipher(decodedKey)
+	block, err := aes.NewCipher(decodedKey)
+	if err != nil {
+		return err
+	}
 	if len(keyBytes)%block.BlockSize() != 0 {
 		return fmt.Errorf("input not full of blocks")
 	}
@@ -143,83 +151,308 @@ func decryptECB(decrypted []byte, keyBytes []byte, decodedKey []byte) error {
 	return nil
 }
 
-func encryptFile(
+func encryptFileCBC(
 	sfe *snowflakeFileEncryption,
 	filename string,
 	chunkSize int,
 	tmpDir string) (
-	*encryptMetadata, string, error) {
+	meta *encryptMetadata, fileName string, err error) {
 	if chunkSize == 0 {
 		chunkSize = aes.BlockSize * 4 * 1024
 	}
-	tmpOutputFile, _ := ioutil.TempFile(tmpDir, baseName(filename)+"#")
-	infile, err := os.OpenFile(filename, os.O_CREATE|os.O_RDONLY, os.ModePerm)
+	tmpOutputFile, err := os.CreateTemp(tmpDir, baseName(filename)+"#")
 	if err != nil {
 		return nil, "", err
 	}
-	meta, err := encryptStream(sfe, infile, tmpOutputFile, chunkSize)
+	defer func() {
+		if tmpErr := tmpOutputFile.Close(); tmpErr != nil && err == nil {
+			err = tmpErr
+		}
+	}()
+	infile, err := os.OpenFile(filename, os.O_CREATE|os.O_RDONLY, readWriteFileMode)
 	if err != nil {
 		return nil, "", err
 	}
-	return meta, tmpOutputFile.Name(), nil
+	defer func() {
+		if tmpErr := infile.Close(); tmpErr != nil && err == nil {
+			err = tmpErr
+		}
+	}()
+
+	meta, err = encryptStreamCBC(sfe, infile, tmpOutputFile, chunkSize)
+	if err != nil {
+		return nil, "", err
+	}
+	return meta, tmpOutputFile.Name(), err
 }
 
-func decryptFile(
+func decryptFileKeyECB(
+	metadata *encryptMetadata,
+	sfe *snowflakeFileEncryption) ([]byte, []byte, error) {
+	decodedKey, err := base64.StdEncoding.DecodeString(sfe.QueryStageMasterKey)
+	if err != nil {
+		return nil, nil, err
+	}
+	keyBytes, err := base64.StdEncoding.DecodeString(metadata.key) // encrypted file key
+	if err != nil {
+		return nil, nil, err
+	}
+	ivBytes, err := base64.StdEncoding.DecodeString(metadata.iv)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// decrypt file key
+	decryptedKey := make([]byte, len(keyBytes))
+	if err = decryptECB(decryptedKey, keyBytes, decodedKey); err != nil {
+		return nil, nil, err
+	}
+	decryptedKey, err = paddingTrim(decryptedKey)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return decryptedKey, ivBytes, err
+}
+
+func initCBC(decryptedKey []byte, ivBytes []byte) (cipher.BlockMode, error) {
+	block, err := aes.NewCipher(decryptedKey)
+	if err != nil {
+		return nil, err
+	}
+	mode := cipher.NewCBCDecrypter(block, ivBytes)
+
+	return mode, err
+}
+
+func decryptFileCBC(
 	metadata *encryptMetadata,
 	sfe *snowflakeFileEncryption,
 	filename string,
 	chunkSize int,
-	tmpDir string) (
-	string, error) {
+	tmpDir string) (outputFileName string, err error) {
+	tmpOutputFile, err := os.CreateTemp(tmpDir, baseName(filename)+"#")
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		if tmpErr := tmpOutputFile.Close(); tmpErr != nil && err == nil {
+			err = tmpErr
+		}
+	}()
+	infile, err := os.Open(filename)
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		if tmpErr := infile.Close(); tmpErr != nil && err == nil {
+			err = tmpErr
+		}
+	}()
+	totalFileSize, err := decryptStreamCBC(metadata, sfe, chunkSize, infile, tmpOutputFile)
+	if err != nil {
+		return "", err
+	}
+	err = tmpOutputFile.Truncate(int64(totalFileSize))
+	return tmpOutputFile.Name(), err
+}
+
+// Returns decrypted file size and any error that happened during decryption.
+func decryptStreamCBC(
+	metadata *encryptMetadata,
+	sfe *snowflakeFileEncryption,
+	chunkSize int,
+	src io.Reader,
+	out io.Writer) (int, error) {
 	if chunkSize == 0 {
 		chunkSize = aes.BlockSize * 4 * 1024
 	}
-	decodedKey, _ := base64.StdEncoding.DecodeString(sfe.QueryStageMasterKey)
-	keyBytes, _ := base64.StdEncoding.DecodeString(metadata.key) // encrypted file key
-	ivBytes, _ := base64.StdEncoding.DecodeString(metadata.iv)
-
-	// decrypt file key
-	decryptedKey := make([]byte, len(keyBytes))
-	if err := decryptECB(decryptedKey, keyBytes, decodedKey); err != nil {
-		return "", err
-	}
-	decryptedKey = paddingTrim(decryptedKey)
-
-	// decrypt file
-	block, _ := aes.NewCipher(decryptedKey)
-	mode := cipher.NewCBCDecrypter(block, ivBytes)
-
-	tmpOutputFile, err := ioutil.TempFile(tmpDir, baseName(filename)+"#")
+	decryptedKey, ivBytes, err := decryptFileKeyECB(metadata, sfe)
 	if err != nil {
-		return "", err
+		return 0, err
 	}
-	defer tmpOutputFile.Close()
-	infile, err := os.OpenFile(filename, os.O_RDONLY, os.ModePerm)
+	mode, err := initCBC(decryptedKey, ivBytes)
 	if err != nil {
-		return "", err
+		return 0, err
 	}
-	defer infile.Close()
+
 	var totalFileSize int
 	var prevChunk []byte
 	for {
 		chunk := make([]byte, chunkSize)
-		n, err := infile.Read(chunk)
+		n, err := src.Read(chunk)
 		if n == 0 || err != nil {
 			break
+		} else if n%aes.BlockSize != 0 {
+			// add padding to the end of the chunk and update the length n
+			chunk = padBytesLength(chunk[:n], aes.BlockSize)
+			n = len(chunk)
 		}
 		totalFileSize += n
 		chunk = chunk[:n]
 		mode.CryptBlocks(chunk, chunk)
-		tmpOutputFile.Write(chunk)
+		if _, err = out.Write(chunk); err != nil {
+			return 0, err
+		}
 		prevChunk = chunk
 	}
 	if err != nil {
-		return "", err
+		return 0, err
 	}
 	if prevChunk != nil {
 		totalFileSize -= paddingOffset(prevChunk)
 	}
-	tmpOutputFile.Truncate(int64(totalFileSize))
+	return totalFileSize, err
+}
+
+func encryptGCM(iv []byte, plaintext []byte, encryptionKey []byte, aad []byte) ([]byte, error) {
+	aead, err := initGcm(encryptionKey)
+	if err != nil {
+		return nil, err
+	}
+	return aead.Seal(nil, iv, plaintext, aad), nil
+}
+
+func decryptGCM(iv []byte, ciphertext []byte, encryptionKey []byte, aad []byte) ([]byte, error) {
+	aead, err := initGcm(encryptionKey)
+	if err != nil {
+		return nil, err
+	}
+	return aead.Open(nil, iv, ciphertext, aad)
+}
+
+func initGcm(encryptionKey []byte) (cipher.AEAD, error) {
+	block, err := aes.NewCipher(encryptionKey)
+	if err != nil {
+		return nil, err
+	}
+	return cipher.NewGCM(block)
+}
+
+func encryptFileGCM(
+	sfe *snowflakeFileEncryption,
+	filename string,
+	tmpDir string) (
+	meta *gcmEncryptMetadata, outputFileName string, err error) {
+	tmpOutputFile, err := os.CreateTemp(tmpDir, baseName(filename)+"#")
+	if err != nil {
+		return nil, "", err
+	}
+	defer func() {
+		if tmpErr := tmpOutputFile.Close(); tmpErr != nil && err == nil {
+			err = tmpErr
+		}
+	}()
+	infile, err := os.OpenFile(filename, os.O_CREATE|os.O_RDONLY, readWriteFileMode)
+	if err != nil {
+		return nil, "", err
+	}
+	defer func() {
+		if tmpErr := infile.Close(); tmpErr != nil && err == nil {
+			err = tmpErr
+		}
+	}()
+	plaintext, err := os.ReadFile(filename)
+	if err != nil {
+		return nil, "", err
+	}
+
+	kek, err := base64.StdEncoding.DecodeString(sfe.QueryStageMasterKey)
+	if err != nil {
+		return nil, "", err
+	}
+	keySize := len(kek)
+	fileKey := getSecureRandom(keySize)
+	keyIv := getSecureRandom(gcmIvLengthInBytes)
+	encryptedFileKey, err := encryptGCM(keyIv, fileKey, kek, defaultKeyAad)
+	if err != nil {
+		return nil, "", err
+	}
+
+	dataIv := getSecureRandom(gcmIvLengthInBytes)
+	encryptedData, err := encryptGCM(dataIv, plaintext, fileKey, defaultDataAad)
+	if err != nil {
+		return nil, "", err
+	}
+	_, err = tmpOutputFile.Write(encryptedData)
+	if err != nil {
+		return nil, "", err
+	}
+
+	matDesc := materialDescriptor{
+		strconv.Itoa(int(sfe.SMKID)),
+		sfe.QueryID,
+		strconv.Itoa(keySize * 8),
+	}
+
+	matDescUnicode, err := matdescToUnicode(matDesc)
+	if err != nil {
+		return nil, "", err
+	}
+	meta = &gcmEncryptMetadata{
+		key:     base64.StdEncoding.EncodeToString(encryptedFileKey),
+		keyIv:   base64.StdEncoding.EncodeToString(keyIv),
+		dataIv:  base64.StdEncoding.EncodeToString(dataIv),
+		keyAad:  base64.StdEncoding.EncodeToString(defaultKeyAad),
+		dataAad: base64.StdEncoding.EncodeToString(defaultDataAad),
+		matdesc: matDescUnicode,
+	}
+	return meta, tmpOutputFile.Name(), nil
+}
+
+func decryptFileGCM(
+	metadata *gcmEncryptMetadata,
+	sfe *snowflakeFileEncryption,
+	filename string,
+	tmpDir string) (
+	string, error) {
+	kek, err := base64.StdEncoding.DecodeString(sfe.QueryStageMasterKey)
+	if err != nil {
+		return "", err
+	}
+	encryptedFileKey, err := base64.StdEncoding.DecodeString(metadata.key)
+	if err != nil {
+		return "", err
+	}
+	keyIv, err := base64.StdEncoding.DecodeString(metadata.keyIv)
+	if err != nil {
+		return "", err
+	}
+	keyAad, err := base64.StdEncoding.DecodeString(metadata.keyAad)
+	if err != nil {
+		return "", err
+	}
+	dataIv, err := base64.StdEncoding.DecodeString(metadata.dataIv)
+	if err != nil {
+		return "", err
+	}
+	dataAad, err := base64.StdEncoding.DecodeString(metadata.dataAad)
+	if err != nil {
+		return "", err
+	}
+
+	fileKey, err := decryptGCM(keyIv, encryptedFileKey, kek, keyAad)
+	if err != nil {
+		return "", err
+	}
+
+	ciphertext, err := os.ReadFile(filename)
+	if err != nil {
+		return "", err
+	}
+	plaintext, err := decryptGCM(dataIv, ciphertext, fileKey, dataAad)
+	if err != nil {
+		return "", err
+	}
+
+	tmpOutputFile, err := os.CreateTemp(tmpDir, baseName(filename)+"#")
+	if err != nil {
+		return "", err
+	}
+	_, err = tmpOutputFile.Write(plaintext)
+	if err != nil {
+		return "", err
+	}
 	return tmpOutputFile.Name(), nil
 }
 
@@ -229,14 +462,20 @@ type materialDescriptor struct {
 	KeySize string `json:"keySize"`
 }
 
-func matdescToUnicode(matdesc materialDescriptor) string {
-	s, _ := json.Marshal(&matdesc)
-	return string(s)
+func matdescToUnicode(matdesc materialDescriptor) (string, error) {
+	s, err := json.Marshal(&matdesc)
+	if err != nil {
+		return "", err
+	}
+	return string(s), nil
 }
 
 func getSecureRandom(byteLength int) []byte {
 	token := make([]byte, byteLength)
-	rand.Read(token)
+	_, err := rand.Read(token)
+	if err != nil {
+		logger.Errorf("cannot init secure random. %v", err)
+	}
 	return token
 }
 
@@ -246,9 +485,16 @@ func padBytesLength(src []byte, blockSize int) []byte {
 	return append(src, padText...)
 }
 
-func paddingTrim(src []byte) []byte {
+func paddingTrim(src []byte) ([]byte, error) {
 	unpadding := src[len(src)-1]
-	return src[:len(src)-int(unpadding)]
+	n := int(unpadding)
+	if n == 0 || n > len(src) {
+		return nil, &SnowflakeError{
+			Number:  ErrInvalidPadding,
+			Message: errMsgInvalidPadding,
+		}
+	}
+	return src[:len(src)-n], nil
 }
 
 func paddingOffset(src []byte) int {
@@ -277,4 +523,33 @@ type encryptionData struct {
 	EncryptionAgent     encryptionAgent `json:"EncryptionAgent,omitempty"`
 	ContentEncryptionIV string          `json:"ContentEncryptionIV,omitempty"`
 	KeyWrappingMetadata keyMetadata     `json:"KeyWrappingMetadata,omitempty"`
+}
+
+type snowflakeFileEncryption struct {
+	QueryStageMasterKey string `json:"queryStageMasterKey,omitempty"`
+	QueryID             string `json:"queryId,omitempty"`
+	SMKID               int64  `json:"smkId,omitempty"`
+}
+
+// PUT requests return a single encryptionMaterial object whereas GET requests
+// return a slice (array) of encryptionMaterial objects, both under the field
+// 'encryptionMaterial'
+type encryptionWrapper struct {
+	snowflakeFileEncryption
+	EncryptionMaterials []snowflakeFileEncryption
+}
+
+type encryptMetadata struct {
+	key     string
+	iv      string
+	matdesc string
+}
+
+type gcmEncryptMetadata struct {
+	key     string
+	keyIv   string
+	dataIv  string
+	keyAad  string
+	dataAad string
+	matdesc string
 }

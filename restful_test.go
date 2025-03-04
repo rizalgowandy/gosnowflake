@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2021 Snowflake Computing Inc. All right reserved.
+// Copyright (c) 2017-2022 Snowflake Computing Inc. All rights reserved.
 
 package gosnowflake
 
@@ -13,46 +13,65 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/google/uuid"
 )
 
-func postTestError(_ context.Context, _ *snowflakeRestful, _ *url.URL, _ map[string]string, _ []byte, _ time.Duration, _ bool) (*http.Response, error) {
+func postTestError(_ context.Context, _ *snowflakeRestful, _ *url.URL, _ map[string]string, _ []byte, _ time.Duration, _ currentTimeProvider, _ *Config) (*http.Response, error) {
 	return &http.Response{
 		StatusCode: http.StatusOK,
 		Body:       &fakeResponseBody{body: []byte{0x12, 0x34}},
 	}, errors.New("failed to run post method")
 }
 
-func postTestSuccessButInvalidJSON(_ context.Context, _ *snowflakeRestful, _ *url.URL, _ map[string]string, _ []byte, _ time.Duration, _ bool) (*http.Response, error) {
+func postAuthTestError(_ context.Context, _ *http.Client, _ *url.URL, _ map[string]string, _ bodyCreatorType, _ time.Duration, _ int) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       &fakeResponseBody{body: []byte{0x12, 0x34}},
+	}, errors.New("failed to run post method")
+}
+
+func postTestSuccessButInvalidJSON(_ context.Context, _ *snowflakeRestful, _ *url.URL, _ map[string]string, _ []byte, _ time.Duration, _ currentTimeProvider, _ *Config) (*http.Response, error) {
 	return &http.Response{
 		StatusCode: http.StatusOK,
 		Body:       &fakeResponseBody{body: []byte{0x12, 0x34}},
 	}, nil
 }
 
-func postTestAppBadGatewayError(_ context.Context, _ *snowflakeRestful, _ *url.URL, _ map[string]string, _ []byte, _ time.Duration, _ bool) (*http.Response, error) {
+func postTestAppBadGatewayError(_ context.Context, _ *snowflakeRestful, _ *url.URL, _ map[string]string, _ []byte, _ time.Duration, _ currentTimeProvider, _ *Config) (*http.Response, error) {
 	return &http.Response{
 		StatusCode: http.StatusBadGateway,
 		Body:       &fakeResponseBody{body: []byte{0x12, 0x34}},
 	}, nil
 }
 
-func postTestAppForbiddenError(_ context.Context, _ *snowflakeRestful, _ *url.URL, _ map[string]string, _ []byte, _ time.Duration, _ bool) (*http.Response, error) {
+func postAuthTestAppBadGatewayError(_ context.Context, _ *http.Client, _ *url.URL, _ map[string]string, _ bodyCreatorType, _ time.Duration, _ int) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: http.StatusBadGateway,
+		Body:       &fakeResponseBody{body: []byte{0x12, 0x34}},
+	}, nil
+}
+
+func postTestAppForbiddenError(_ context.Context, _ *snowflakeRestful, _ *url.URL, _ map[string]string, _ []byte, _ time.Duration, _ currentTimeProvider, _ *Config) (*http.Response, error) {
 	return &http.Response{
 		StatusCode: http.StatusForbidden,
 		Body:       &fakeResponseBody{body: []byte{0x12, 0x34}},
 	}, nil
 }
 
-func postTestAppUnexpectedError(_ context.Context, _ *snowflakeRestful, _ *url.URL, _ map[string]string, _ []byte, _ time.Duration, _ bool) (*http.Response, error) {
+func postAuthTestAppForbiddenError(_ context.Context, _ *http.Client, _ *url.URL, _ map[string]string, _ bodyCreatorType, _ time.Duration, _ int) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: http.StatusForbidden,
+		Body:       &fakeResponseBody{body: []byte{0x12, 0x34}},
+	}, nil
+}
+
+func postAuthTestAppUnexpectedError(_ context.Context, _ *http.Client, _ *url.URL, _ map[string]string, _ bodyCreatorType, _ time.Duration, _ int) (*http.Response, error) {
 	return &http.Response{
 		StatusCode: http.StatusInsufficientStorage,
 		Body:       &fakeResponseBody{body: []byte{0x12, 0x34}},
 	}, nil
 }
 
-func postTestQueryNotExecuting(_ context.Context, _ *snowflakeRestful, _ *url.URL, _ map[string]string, _ []byte, _ time.Duration, _ bool) (*http.Response, error) {
+func postTestQueryNotExecuting(_ context.Context, _ *snowflakeRestful, _ *url.URL, _ map[string]string, _ []byte, _ time.Duration, _ currentTimeProvider, _ *Config) (*http.Response, error) {
 	dd := &execResponseData{}
 	er := &execResponse{
 		Data:    *dd,
@@ -71,7 +90,7 @@ func postTestQueryNotExecuting(_ context.Context, _ *snowflakeRestful, _ *url.UR
 	}, nil
 }
 
-func postTestRenew(_ context.Context, _ *snowflakeRestful, _ *url.URL, _ map[string]string, _ []byte, _ time.Duration, _ bool) (*http.Response, error) {
+func postTestRenew(_ context.Context, _ *snowflakeRestful, _ *url.URL, _ map[string]string, _ []byte, _ time.Duration, _ currentTimeProvider, _ *Config) (*http.Response, error) {
 	dd := &execResponseData{}
 	er := &execResponse{
 		Data:    *dd,
@@ -91,7 +110,7 @@ func postTestRenew(_ context.Context, _ *snowflakeRestful, _ *url.URL, _ map[str
 	}, nil
 }
 
-func postTestAfterRenew(_ context.Context, _ *snowflakeRestful, _ *url.URL, _ map[string]string, _ []byte, _ time.Duration, _ bool) (*http.Response, error) {
+func postAuthTestAfterRenew(_ context.Context, _ *http.Client, _ *url.URL, _ map[string]string, _ bodyCreatorType, _ time.Duration, _ int) (*http.Response, error) {
 	dd := &execResponseData{}
 	er := &execResponse{
 		Data:    *dd,
@@ -111,11 +130,34 @@ func postTestAfterRenew(_ context.Context, _ *snowflakeRestful, _ *url.URL, _ ma
 	}, nil
 }
 
-func cancelTestRetry(ctx context.Context, sr *snowflakeRestful, requestID uuid.UUID, timeout time.Duration) error {
+func postTestAfterRenew(_ context.Context, _ *snowflakeRestful, _ *url.URL, _ map[string]string, _ []byte, _ time.Duration, _ currentTimeProvider, _ *Config) (*http.Response, error) {
+	dd := &execResponseData{}
+	er := &execResponse{
+		Data:    *dd,
+		Message: "",
+		Code:    "",
+		Success: true,
+	}
+
+	ba, err := json.Marshal(er)
+	logger.Infof("encoded JSON: %v", ba)
+	if err != nil {
+		panic(err)
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       &fakeResponseBody{body: ba},
+	}, nil
+}
+
+func cancelTestRetry(ctx context.Context, sr *snowflakeRestful, requestID UUID, timeout time.Duration) error {
 	ctxRetry := getCancelRetry(ctx)
 	u := url.URL{}
-	reqByte, _ := json.Marshal(make(map[string]string))
-	resp, err := sr.FuncPost(ctx, sr, &u, getHeaders(), reqByte, timeout, false)
+	reqByte, err := json.Marshal(make(map[string]string))
+	if err != nil {
+		return err
+	}
+	resp, err := sr.FuncPost(ctx, sr, &u, getHeaders(), reqByte, timeout, defaultTimeProvider, nil)
 	if err != nil {
 		return err
 	}
@@ -141,24 +183,53 @@ func TestUnitPostQueryHelperError(t *testing.T) {
 		TokenAccessor: getSimpleTokenAccessor(),
 	}
 	var err error
-	var requestID uuid.UUID
-	requestID = uuid.New()
+	requestID := NewUUID()
 	_, err = postRestfulQueryHelper(context.Background(), sr, &url.Values{}, make(map[string]string), []byte{0x12, 0x34}, 0, requestID, &Config{})
 	if err == nil {
 		t.Fatalf("should have failed to post")
 	}
 	sr.FuncPost = postTestAppBadGatewayError
-	requestID = uuid.New()
+	requestID = NewUUID()
 	_, err = postRestfulQueryHelper(context.Background(), sr, &url.Values{}, make(map[string]string), []byte{0x12, 0x34}, 0, requestID, &Config{})
 	if err == nil {
 		t.Fatalf("should have failed to post")
 	}
 	sr.FuncPost = postTestSuccessButInvalidJSON
-	requestID = uuid.New()
+	requestID = NewUUID()
 	_, err = postRestfulQueryHelper(context.Background(), sr, &url.Values{}, make(map[string]string), []byte{0x12, 0x34}, 0, requestID, &Config{})
 	if err == nil {
 		t.Fatalf("should have failed to post")
 	}
+}
+
+func TestUnitPostQueryHelperOnRenewSessionKeepsRequestIdButGeneratesNewRequestGuid(t *testing.T) {
+	postCount := 0
+	requestID := NewUUID()
+
+	sr := &snowflakeRestful{
+		FuncPost: func(ctx context.Context, restful *snowflakeRestful, url *url.URL, headers map[string]string, bytes []byte, duration time.Duration, provider currentTimeProvider, config *Config) (*http.Response, error) {
+			assertEqualF(t, len((url.Query())[requestIDKey]), 1)
+			assertEqualF(t, len((url.Query())[requestGUIDKey]), 1)
+			return &http.Response{
+				StatusCode: 200,
+				Body:       &fakeResponseBody{body: []byte(`{"data":null,"code":"390112","message":"token expired for testing","success":false,"headers":null}`)},
+			}, nil
+		},
+		FuncPostQuery: func(ctx context.Context, restful *snowflakeRestful, values *url.Values, headers map[string]string, bytes []byte, timeout time.Duration, uuid UUID, config *Config) (*execResponse, error) {
+			assertEqualF(t, requestID.String(), uuid.String())
+			assertEqualF(t, len((*values)[requestIDKey]), 1)
+			assertEqualF(t, len((*values)[requestGUIDKey]), 1)
+			if postCount == 0 {
+				postCount++
+				return postRestfulQueryHelper(ctx, restful, values, headers, bytes, timeout, uuid, config)
+			}
+			return nil, nil
+		},
+		FuncRenewSession: renewSessionTest,
+		TokenAccessor:    getSimpleTokenAccessor(),
+	}
+	_, err := postRestfulQueryHelper(context.Background(), sr, &url.Values{}, make(map[string]string), make([]byte, 0), time.Second, requestID, nil)
+	assertNilE(t, err)
 }
 
 func renewSessionTest(_ context.Context, _ *snowflakeRestful, _ time.Duration) error {
@@ -187,7 +258,7 @@ func TestUnitTokenAccessorDoesNotRenewStaleToken(t *testing.T) {
 	}
 
 	// try to intentionally renew with stale token
-	sr.renewExpiredSessionToken(context.Background(), time.Hour, "stale-token")
+	assertNilE(t, sr.renewExpiredSessionToken(context.Background(), time.Hour, "stale-token"))
 
 	if renewSessionCalled {
 		t.Fatal("FuncRenewSession should not have been called")
@@ -195,7 +266,7 @@ func TestUnitTokenAccessorDoesNotRenewStaleToken(t *testing.T) {
 
 	// set the current token to empty, should still call renew even if stale token is passed in
 	accessor.SetTokens("", "master", 123)
-	sr.renewExpiredSessionToken(context.Background(), time.Hour, "stale-token")
+	assertNilE(t, sr.renewExpiredSessionToken(context.Background(), time.Hour, "stale-token"))
 
 	if !renewSessionCalled {
 		t.Fatal("FuncRenewSession should have been called because current token is empty")
@@ -246,7 +317,7 @@ func TestUnitTokenAccessorRenewBlocked(t *testing.T) {
 	}
 
 	// intentionally lock the accessor first
-	accessor.Lock()
+	assertNilE(t, accessor.Lock())
 
 	// try to intentionally renew with stale token
 	var renewalStart sync.WaitGroup
@@ -255,7 +326,7 @@ func TestUnitTokenAccessorRenewBlocked(t *testing.T) {
 	renewalDone.Add(1)
 	go func() {
 		renewalStart.Done()
-		sr.renewExpiredSessionToken(context.Background(), time.Hour, oldToken)
+		assertNilE(t, sr.renewExpiredSessionToken(context.Background(), time.Hour, oldToken))
 		renewalDone.Done()
 	}()
 
@@ -280,7 +351,7 @@ func TestUnitTokenAccessorRenewBlocked(t *testing.T) {
 	}
 
 	// wait for accessor defer unlock
-	accessor.Lock()
+	assertNilE(t, accessor.Lock())
 	if accessor.lockCallCount != 3 {
 		t.Fatalf("Expected Lock() to be called thrice, but got %v", accessor.lockCallCount)
 	}
@@ -359,7 +430,7 @@ func TestUnitPostQueryHelperUsesToken(t *testing.T) {
 	accessor.SetTokens(token, "", 0)
 
 	var err error
-	postQueryTest := func(_ context.Context, _ *snowflakeRestful, _ *url.Values, headers map[string]string, _ []byte, _ time.Duration, _ uuid.UUID, _ *Config) (*execResponse, error) {
+	postQueryTest := func(_ context.Context, _ *snowflakeRestful, _ *url.Values, headers map[string]string, _ []byte, _ time.Duration, _ UUID, _ *Config) (*execResponse, error) {
 		if headers[headerAuthorizationKey] != fmt.Sprintf(headerSnowflakeToken, token) {
 			t.Fatalf("authorization key doesn't match, %v vs %v", headers[headerAuthorizationKey], fmt.Sprintf(headerSnowflakeToken, token))
 		}
@@ -377,7 +448,7 @@ func TestUnitPostQueryHelperUsesToken(t *testing.T) {
 		FuncRenewSession: renewSessionTest,
 		TokenAccessor:    accessor,
 	}
-	_, err = postRestfulQueryHelper(context.Background(), sr, &url.Values{}, make(map[string]string), []byte{0x12, 0x34}, 0, uuid.New(), &Config{})
+	_, err = postRestfulQueryHelper(context.Background(), sr, &url.Values{}, make(map[string]string), []byte{0x12, 0x34}, 0, NewUUID(), &Config{})
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -385,8 +456,8 @@ func TestUnitPostQueryHelperUsesToken(t *testing.T) {
 
 func TestUnitPostQueryHelperRenewSession(t *testing.T) {
 	var err error
-	origRequestID := uuid.New()
-	postQueryTest := func(_ context.Context, _ *snowflakeRestful, _ *url.Values, _ map[string]string, _ []byte, _ time.Duration, requestID uuid.UUID, _ *Config) (*execResponse, error) {
+	origRequestID := NewUUID()
+	postQueryTest := func(_ context.Context, _ *snowflakeRestful, _ *url.Values, _ map[string]string, _ []byte, _ time.Duration, requestID UUID, _ *Config) (*execResponse, error) {
 		// ensure the same requestID is used after the session token is renewed.
 		if requestID != origRequestID {
 			t.Fatal("requestID doesn't match")
@@ -421,7 +492,7 @@ func TestUnitRenewRestfulSession(t *testing.T) {
 	accessor := getSimpleTokenAccessor()
 	oldToken, oldMasterToken, oldSessionID := "oldtoken", "oldmaster", int64(100)
 	newToken, newMasterToken, newSessionID := "newtoken", "newmaster", int64(200)
-	postTestSuccessWithNewTokens := func(_ context.Context, _ *snowflakeRestful, _ *url.URL, headers map[string]string, _ []byte, _ time.Duration, _ bool) (*http.Response, error) {
+	postTestSuccessWithNewTokens := func(_ context.Context, _ *snowflakeRestful, _ *url.URL, headers map[string]string, _ []byte, _ time.Duration, _ currentTimeProvider, _ *Config) (*http.Response, error) {
 		if headers[headerAuthorizationKey] != fmt.Sprintf(headerSnowflakeToken, oldMasterToken) {
 			t.Fatalf("authorization key doesn't match, %v vs %v", headers[headerAuthorizationKey], fmt.Sprintf(headerSnowflakeToken, oldMasterToken))
 		}
